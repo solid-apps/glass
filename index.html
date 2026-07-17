@@ -1436,7 +1436,7 @@ function buildFinder(body, win, args) {
 
   const FAVS = [["Desktop", "🖥️"], ["Documents", "📄"], ["Notes", "📝"], ["Photos", "🖼️"], ["Applications", "🚀"]];
   side.append(h("div", { class: "sb-h" }, "Favorites"),
-    FAVS.map(([n, ic]) => h("div", {
+    ...FAVS.map(([n, ic]) => h("div", {
       class: "sb-i", dataset: { path: "/" + n },
       onclick: () => nav("/" + n)
     }, h("span", null, ic), n)),
