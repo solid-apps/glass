@@ -1580,10 +1580,10 @@ function buildNotes(body, win, args) {
     const files = (VFS.ls("/Notes") || []).filter(n => n.type === "file");
     const extra = st.path && !st.path.startsWith("/Notes/") ? [VFS.node(st.path)] : [];
     listEl.replaceChildren(
-      extra.filter(Boolean).map(n => h("div", {
+      ...extra.filter(Boolean).map(n => h("div", {
         class: "li sel", onclick: () => openFile(st.path)
       }, h("span", { class: "li-ico" }, "📄"), h("span", { class: "li-name" }, n.name), h("span", { class: "li-meta" }, "file"))),
-      files.map(n => {
+      ...files.map(n => {
         const p = "/Notes/" + n.name;
         return h("div", {
           class: "li" + (st.path === p ? " sel" : ""),
@@ -2063,7 +2063,7 @@ function buildMusic(body, win) {
     paintList();
   }
   function paintList() {
-    listEl.replaceChildren(TRACKS.map((t, i) =>
+    listEl.replaceChildren(...TRACKS.map((t, i) =>
       h("div", { class: "mui" + (i === st.i ? " on" : ""), onclick: () => { const was = st.playing; stopTo(i); if (was) toggle(); } },
         h("span", { class: "n" }, i === st.i && st.playing ? "▶" : i + 1),
         h("div", null, h("div", null, t.title), h("div", { class: "muted small" }, t.artist)),
@@ -2176,7 +2176,7 @@ function buildPhotos(body, win, args) {
   const files = () => (VFS.ls("/Photos") || []).filter(n => extOf(n.name) === "png");
 
   function paintGrid() {
-    grid.replaceChildren(files().map((n, i) =>
+    grid.replaceChildren(...files().map((n, i) =>
       h("div", { class: "ph", onclick: () => show(i) }, h("img", { src: n.content, alt: n.name }))));
   }
   function show(i) {
@@ -2252,7 +2252,7 @@ function buildWeather(body) {
         h("div", { class: "wx-cond" }, `${d.cond[0]} · H:${conv(d.hi)} L:${conv(d.lo)}`)));
     const names = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
     const today = new Date().getDay();
-    daysEl.replaceChildren([1, 2, 3, 4, 5].map(o => {
+    daysEl.replaceChildren(...[1, 2, 3, 4, 5].map(o => {
       const dd = dayData(city, o);
       return h("div", { class: "wx-day" },
         h("div", { class: "d" }, names[(today + o) % 7]),
@@ -2286,7 +2286,7 @@ function buildClock(body, win) {
         const t = h("span", { class: "zt" });
         return { el: h("div", { class: "ck-zone" }, h("span", { class: "zn" }, name), t), t, tz };
       });
-      content.append(rows.map(r => r.el));
+      content.append(...rows.map(r => r.el));
       const tick = () => rows.forEach(r => r.t.textContent = new Date().toLocaleTimeString("en-US", { timeZone: r.tz, hour: "numeric", minute: "2-digit" }));
       tick(); timers.push(setInterval(tick, 1000));
     } else if (tab === "sw") {
