@@ -24,6 +24,11 @@
   --radius: 14px;
   --mb-h: 30px;
   --shadow-win: 0 30px 80px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(255,255,255,0.06);
+  /* aliases used by solid-apps registry panes/apps, so they theme correctly here */
+  --sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif;
+  --mono: "SF Mono", ui-monospace, Menlo, monospace;
+  --bg-elev: rgba(255, 255, 255, 0.06);
+  --bg-elev-2: rgba(255, 255, 255, 0.10);
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; user-select: none; }
@@ -610,6 +615,10 @@ input[type="range"]::-webkit-slider-thumb {
   <div id="mc-hint">Overview — click a window, or press Esc</div>
   <div id="sleep"><div>Click anywhere to wake</div></div>
 
+<!-- xlogin: one-tag auth (Solid OIDC + Nostr) — same tag chrome/ubuntu use,
+     loaded before the main script so auth listeners are wired before xlogin
+     restores a session. Glass works fully logged-out if unpkg is unreachable. -->
+<script src="https://unpkg.com/xlogin"></script>
 <script>
 "use strict";
 /* ============================== HELPERS ============================== */
@@ -797,6 +806,470 @@ const VFS = (() => {
 })();
 // == END VFS ==
 
+/* ============================== AUTH (xlogin) ============================== */
+// Thin reactive wrapper over the xlogin widget — same pattern as chrome's
+// src/auth.js, so ctx.auth / ctx.fetch given to panes behave identically.
+const Auth = (() => {
+  const state = { type: null, id: null, loggedIn: false };
+  const fns = new Set();
+  const fire = () => fns.forEach(f => { try { f(state); } catch (e) {} });
+  const update = d => {
+    state.type = d?.type || null; state.id = d?.id || null; state.loggedIn = !!state.id;
+    fire();
+  };
+  document.addEventListener("xlogin", e => update(e.detail));
+  document.addEventListener("xlogout", () => update(null));
+  // xlogin restores sessions asynchronously — poll briefly until settled.
+  let polls = 0;
+  const t = setInterval(() => {
+    if (window.xlogin?.id && !state.loggedIn) update({ type: window.xlogin.type, id: window.xlogin.id });
+    if (++polls > 20) clearInterval(t);
+  }, 500);
+  return {
+    get: () => ({ ...state }),
+    on(f) { fns.add(f); f(state); return () => fns.delete(f); },
+    fetch: (url, init) => (window.xlogin && window.xlogin.authFetch ? window.xlogin.authFetch(url, init) : fetch(url, init)),
+    login: () => window.xlogin?.login?.(),
+    logout: () => window.xlogin?.logout?.(),
+  };
+})();
+
+/* ============================== VFS CHANGE BUS ============================== */
+const VFSBus = (() => {
+  const fns = new Set();
+  return {
+    on(f) { fns.add(f); return () => fns.delete(f); },
+    emit(path) { fns.forEach(f => { try { f(path); } catch (e) {} }); },
+  };
+})();
+
+/* ============================== POD (LDP write-through cache) ============================== */
+// The VFS stays synchronous; the pod is mounted at /Pod as a lazily-hydrated
+// write-through cache. Reads come from the cache (hydrated per-container over
+// LDP JSON-LD); writes land in the cache instantly and PUT/DELETE in the
+// background; Updates-Via WebSockets re-hydrate when another client writes.
+const Pod = (() => {
+  const MOUNT = "/Pod";
+  let storage = null;
+  const status = { connected: false, syncing: 0, error: null };
+
+  // Raw (un-hooked) VFS ops for cache population — the public VFS methods are
+  // wrapped below for write-through, and hydration must not echo PUTs.
+  const raw = { write: VFS.write, mkdir: VFS.mkdir, rm: VFS.rm, restore: VFS.restore };
+
+  const MIMES = { txt: "text/plain", md: "text/markdown", html: "text/html", css: "text/css",
+    js: "text/javascript", json: "application/json", jsonld: "application/ld+json",
+    ttl: "text/turtle", csv: "text/csv", log: "text/plain", png: "image/png", jpg: "image/jpeg" };
+  const mimeFor = name => MIMES[extOf(name)] || "text/plain";
+  const idOf = v => (typeof v === "string" ? v : (v && v["@id"]) || null);
+  const litOf = v => (v && typeof v === "object" ? (v["@value"] ?? null) : v);
+  const resolveUrl = (href, base) => { try { return new URL(href, base).href; } catch (e) { return href; } };
+  const underMount = p => p === MOUNT || p.startsWith(MOUNT + "/");
+
+  function findSubject(doc, frag) {
+    const nodes = Array.isArray(doc?.["@graph"]) ? doc["@graph"] : [doc];
+    if (frag) {
+      const m = nodes.find(n => typeof n["@id"] === "string" && n["@id"].endsWith("#" + frag));
+      if (m) return m;
+    }
+    return nodes[0] || {};
+  }
+
+  async function ldGet(url) {
+    const r = await Auth.fetch(url, { cache: "no-cache", headers: { Accept: "application/ld+json" } });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    return r.json();
+  }
+
+  // Same parse as chrome's Files built-in — ldp:contains in any of its
+  // compacted spellings, container-ness by @type or trailing slash.
+  function parseContainer(doc, baseUrl) {
+    const nodes = Array.isArray(doc?.["@graph"]) ? doc["@graph"] : [doc];
+    const container = nodes.find(n =>
+      n["@id"] === baseUrl ||
+      (typeof n["@id"] === "string" && resolveUrl(n["@id"], baseUrl) === baseUrl)) || nodes[0];
+    if (!container) return [];
+    const rawC = container["contains"] ?? container["ldp:contains"] ?? container["http://www.w3.org/ns/ldp#contains"] ?? [];
+    const arr = Array.isArray(rawC) ? rawC : [rawC];
+    return arr.map(c => {
+      if (typeof c === "string") return { url: resolveUrl(c, baseUrl), type: c.endsWith("/") ? "container" : "resource" };
+      const url = resolveUrl(c["@id"], baseUrl);
+      const types = [].concat(c["@type"] || []);
+      const isContainer = types.some(t => /(?:#|\/)(?:BasicContainer|Container)$/.test(t)) || url.endsWith("/");
+      return {
+        url, type: isContainer ? "container" : "resource",
+        size: litOf(c["stat:size"] ?? c["http://www.w3.org/ns/posix/stat#size"]),
+        modified: litOf(c["dcterms:modified"] ?? c["http://purl.org/dc/terms/modified"] ?? c["dc:modified"]),
+      };
+    }).filter(x => x.url && x.url !== baseUrl);
+  }
+
+  async function discoverStorage(webid) {
+    const doc = await ldGet(webid.replace(/#.*$/, "")).catch(() => null);
+    if (!doc) return null;
+    const subj = findSubject(doc, webid.includes("#") ? webid.split("#")[1] : null);
+    let st = idOf(subj["pim:storage"] ?? subj["http://www.w3.org/ns/pim/space#storage"] ?? subj["storage"]);
+    if (!st) { try { st = new URL(webid).origin + "/"; } catch (e) { return null; } }
+    if (!st.endsWith("/")) st += "/";
+    if (!/^https?:/.test(st)) st = new URL(st, webid).href;
+    return st;
+  }
+
+  // Some pods (e.g. jspod) serve a static index.html at the root, shadowing
+  // the LDP listing — fall back to /public/ like chrome's Files does.
+  async function looksLikeRdf(url) {
+    try {
+      const r = await Auth.fetch(url, { headers: { Accept: "application/ld+json" } });
+      if (!r.ok) return false;
+      const ct = (r.headers.get("content-type") || "").toLowerCase();
+      if (ct.includes("json") || ct.includes("turtle")) return true;
+      const body = (await r.text()).trim();
+      return body.startsWith("{") || body.startsWith("[");
+    } catch (e) { return false; }
+  }
+  async function pickStart(st) {
+    if (await looksLikeRdf(st)) return st;
+    const pub = st + "public/";
+    if (await looksLikeRdf(pub)) return pub;
+    return st;
+  }
+
+  function ensureMount() {
+    let n = VFS.node(MOUNT);
+    if (!n) n = raw.mkdir(MOUNT);
+    n.remote = storage; n.loaded = false; n.children = {};
+    status.connected = true; status.error = null;
+    renderDeskIcons();
+    VFSBus.emit(MOUNT);
+    return hydrate(MOUNT);
+  }
+
+  async function hydrate(path) {
+    const n = VFS.node(path);
+    if (!n || n.type !== "dir" || !n.remote || n.hydrating) return;
+    n.hydrating = true; status.syncing++; VFSBus.emit(path);
+    try {
+      const items = parseContainer(await ldGet(n.remote), n.remote);
+      const seen = new Set();
+      for (const it of items) {
+        const name = decodeURIComponent(it.url.replace(/\/$/, "").split("/").pop() || "");
+        if (!name || name.includes("/")) continue;
+        seen.add(name);
+        let child = n.children[name];
+        if (!child) {
+          child = it.type === "container" ? raw.mkdir(path + "/" + name) : raw.write(path + "/" + name, "", "/");
+          if (child && it.type !== "container") child.loaded = false;
+        }
+        if (!child) continue;
+        child.remote = it.url;
+        if (it.size != null) child.remoteSize = +it.size;
+        const m = it.modified && Date.parse(it.modified);
+        if (m) child.modified = m;
+      }
+      for (const [name, c] of Object.entries(n.children)) {
+        if (c.remote && !seen.has(name) && !c.pending) delete n.children[name];
+      }
+      n.loaded = true;
+      subscribeUrl(n.remote, () => hydrate(path)).catch(() => {});
+    } catch (e) { status.error = e.message; }
+    n.hydrating = false; status.syncing--;
+    VFSBus.emit(path);
+  }
+
+  async function loadFile(path) {
+    const n = VFS.node(path);
+    if (!n || n.type !== "file" || !n.remote || n.loaded) return n;
+    status.syncing++;
+    try {
+      const r = await Auth.fetch(n.remote, { cache: "no-cache" });
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      const ct = (r.headers.get("content-type") || "").toLowerCase();
+      n.mime = ct.split(";")[0] || n.mime;
+      // Images keep the URL as content — <img src> can render it directly.
+      n.content = ct.startsWith("image/") ? n.remote : await r.text();
+      n.loaded = true;
+    } catch (e) { status.error = e.message; }
+    status.syncing--; VFSBus.emit(path);
+    return n;
+  }
+
+  // ---- write-through ----
+  const timers = new Map();
+  function schedulePush(path) {
+    if (!status.connected) return;
+    clearTimeout(timers.get(path));
+    const n = VFS.node(path);
+    if (n) n.pending = true;
+    timers.set(path, setTimeout(() => { timers.delete(path); push(path).catch(() => {}); }, 400));
+  }
+  async function push(path) {
+    const n = VFS.node(path);
+    if (!n) return;
+    if (!n.remote) {
+      const pr = VFS.parent(path);
+      const parentRemote = pr && pr.dir && pr.dir.remote;
+      if (!parentRemote) return;
+      n.remote = parentRemote + encodeURIComponent(n.name) + (n.type === "dir" ? "/" : "");
+    }
+    status.syncing++; VFSBus.emit(path);
+    try {
+      const r = n.type === "dir"
+        ? await Auth.fetch(n.remote, { method: "PUT", body: "", headers: {
+            "Content-Type": "text/turtle", "Link": '<http://www.w3.org/ns/ldp#BasicContainer>; rel="type"' } })
+        : await Auth.fetch(n.remote, { method: "PUT", body: n.content || "", headers: { "Content-Type": mimeFor(n.name) } });
+      if (!r.ok && r.status !== 409) throw new Error("HTTP " + r.status);
+      n.loaded = true; n.pending = false; status.error = null;
+    } catch (e) {
+      status.error = e.message;
+      notify("Pod sync failed", n.name + " — " + e.message, "⚠️");
+    }
+    status.syncing--; VFSBus.emit(path);
+  }
+
+  VFS.write = (path, content, cwd, mime) => {
+    const f = raw.write(path, content, cwd, mime);
+    if (f) {
+      const p = VFS.norm(path, cwd);
+      if (underMount(p) && status.connected) schedulePush(p);
+      VFSBus.emit(p);
+    }
+    return f;
+  };
+  VFS.mkdir = (path, cwd) => {
+    const d = raw.mkdir(path, cwd);
+    if (d) {
+      const p = VFS.norm(path, cwd);
+      if (underMount(p) && status.connected) schedulePush(p);
+      VFSBus.emit(p);
+    }
+    return d;
+  };
+  VFS.rm = (path, cwd) => {
+    const p = VFS.norm(path, cwd);
+    const wasRemote = underMount(p) && status.connected;
+    const t = raw.rm(path, cwd);
+    if (t) {
+      if (wasRemote && t.remote) {
+        Auth.fetch(t.remote, { method: "DELETE" }).then(r => {
+          if (!r.ok && r.status !== 404) notify("Pod delete failed", t.name + " — HTTP " + r.status, "⚠️");
+        }).catch(e => notify("Pod delete failed", t.name + " — " + e.message, "⚠️"));
+      }
+      VFSBus.emit(p);
+    }
+    return t;
+  };
+  VFS.restore = trashName => {
+    const t = VFS.node("/.Trash/" + trashName);
+    const from = t && t._from;
+    const ok = raw.restore(trashName);
+    if (ok && from && underMount(from) && status.connected) {
+      const n = VFS.node(from);
+      if (n) { n.remote = null; schedulePush(from); }
+    }
+    if (ok) VFSBus.emit(from || "/");
+    return ok;
+  };
+
+  // ---- solid-0.1 WebSocket notifications (Updates-Via), best-effort ----
+  const sockets = new Map(); // wsUrl → { ws, subs: Map<url, Set<cb>> }
+  async function subscribeUrl(url, cb) {
+    const r = await Auth.fetch(url, { method: "HEAD", cache: "no-store" });
+    const via = r.headers.get("Updates-Via");
+    if (!via) throw new Error("no Updates-Via");
+    let entry = sockets.get(via);
+    if (!entry || entry.ws.readyState > WebSocket.OPEN) {
+      entry = { ws: new WebSocket(via), subs: new Map() };
+      sockets.set(via, entry);
+      entry.ws.addEventListener("message", e => {
+        const s = String(e.data || "").trim();
+        if (!s.startsWith("pub ")) return;
+        const cbs = entry.subs.get(s.slice(4));
+        if (cbs) cbs.forEach(f => { try { f(); } catch (err) {} });
+      });
+      entry.ws.addEventListener("close", () => sockets.delete(via));
+    }
+    if (entry.ws.readyState === WebSocket.CONNECTING) {
+      await new Promise(res => entry.ws.addEventListener("open", res, { once: true }));
+    }
+    if (!entry.subs.has(url)) {
+      entry.subs.set(url, new Set());
+      entry.ws.send("sub " + url);
+    }
+    entry.subs.get(url).add(cb);
+    return () => { const set = entry.subs.get(url); if (set) set.delete(cb); };
+  }
+
+  // ---- connect / disconnect ----
+  async function connect(webid) {
+    const st = await discoverStorage(webid);
+    if (!st) throw new Error("couldn't find your pod's storage root");
+    storage = await pickStart(st);
+    await ensureMount();
+    notify("Pod connected", storage, "🪐");
+  }
+  async function mount(url) {
+    storage = url.endsWith("/") ? url : url + "/";
+    await ensureMount();
+  }
+  function disconnect() {
+    if (!status.connected) return;
+    storage = null; status.connected = false;
+    const pr = VFS.parent(MOUNT);
+    if (pr && pr.dir) delete pr.dir.children[pr.name];
+    sockets.forEach(e => { try { e.ws.close(); } catch (err) {} });
+    sockets.clear();
+    renderDeskIcons();
+    VFSBus.emit("/");
+  }
+
+  Auth.on(a => {
+    if (a.loggedIn && a.type === "solid") {
+      connect(a.id).catch(e => notify("Pod", e.message, "⚠️"));
+    } else if (!a.loggedIn) {
+      disconnect();
+    }
+  });
+
+  return { MOUNT, status, connect, disconnect, mount, hydrate, loadFile, subscribeUrl,
+    get storage() { return storage; } };
+})();
+
+/* ============================== PANES (SLIP-48 / solid-apps registry) ============================== */
+// Glass hosts the same registry panes and hub-shaped apps as chrome, ubuntu,
+// win98, and hub: panes render per-subject via the SLIP-48 5-arg call,
+// apps via render(container, ctx). Being served from solid-apps.github.io
+// means hub's pinned pane defaults (localStorage) apply here too.
+const Panes = (() => {
+  const REGISTRY_URL = "https://solid-apps.github.io/registry/index.json";
+  const RDF_TYPE = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+  let regP = null;
+  const modCache = new Map();
+  const localName = s => String(s || "").split(/[#/:]/).pop();
+
+  function loadRegistry() {
+    if (!regP) {
+      regP = fetch(REGISTRY_URL, { cache: "no-cache", headers: { Accept: "application/ld+json" } })
+        .then(async r => {
+          if (!r.ok) throw new Error("registry HTTP " + r.status);
+          const doc = await r.json();
+          const rawL = doc["schema:itemListElement"] ?? doc["itemListElement"] ?? [];
+          return (Array.isArray(rawL) ? rawL : [rawL]).map(e => ({
+            type: e["@type"] === "urn:Pane" ? "pane" : "app",
+            url: e["@id"],
+            name: e["schema:name"] || "",
+            description: e["schema:description"] || "",
+            icon: e["schema:icon"] || "📦",
+            author: e["schema:author"] || "",
+            forClass: e["urn:forClass"] || null,
+          })).filter(x => x.url);
+        })
+        .catch(e => { regP = null; throw e; });
+    }
+    return regP;
+  }
+
+  async function loadModule(url) {
+    if (modCache.has(url)) return modCache.get(url);
+    const mod = await import(url);
+    const app = (mod.default && typeof mod.default.render === "function") ? mod.default
+      : (typeof mod.render === "function" ? mod : null);
+    if (!app) throw new Error("module didn't expose a render() function");
+    modCache.set(url, app);
+    return app;
+  }
+
+  async function paneIndex() {
+    const entries = await loadRegistry();
+    const m = new Map();
+    for (const e of entries) {
+      if (e.type !== "pane" || !e.forClass) continue;
+      for (const c of (Array.isArray(e.forClass) ? e.forClass : [e.forClass])) m.set(c, e);
+    }
+    return m;
+  }
+
+  async function findPaneFor(types) {
+    if (!Array.isArray(types) || !types.length) return null;
+    const index = await paneIndex();
+    // Honour hub's pinned default pane per class — same-origin localStorage.
+    let defaults = {};
+    try { defaults = JSON.parse(localStorage.getItem("hubpod-pane-defaults") || "{}"); } catch (e) {}
+    const byUrl = new Map([...index.values()].map(e => [e.url, e]));
+    for (const t of types) {
+      if (typeof t !== "string") continue;
+      for (const cls of Object.keys(defaults)) {
+        if (cls === t || localName(cls) === localName(t)) {
+          const e = byUrl.get(defaults[cls]);
+          if (e) return e;
+        }
+      }
+    }
+    for (const t of types) if (typeof t === "string" && index.has(t)) return index.get(t);
+    for (const t of types) {
+      if (typeof t !== "string") continue;
+      const tln = localName(t);
+      for (const [cls, entry] of index) if (localName(cls) === tln) return entry;
+    }
+    return null;
+  }
+
+  function extractTypes(doc, url) {
+    if (!doc) return [];
+    const nodes = Array.isArray(doc?.["@graph"]) ? doc["@graph"] : [doc];
+    let subj = nodes.find(n => n["@id"] === url)
+      || nodes.find(n => typeof n["@id"] === "string" && /^#/.test(n["@id"]))
+      || nodes.find(n => n["@type"]) || nodes[0];
+    if (!subj) return [];
+    const out = [], seen = new Set();
+    const addFrom = n => {
+      for (const v of [].concat(n?.["@type"] || [])) {
+        if (typeof v === "string" && !seen.has(v)) { seen.add(v); out.push(v); }
+      }
+    };
+    addFrom(subj);
+    for (const n of nodes) if (n !== subj) addFrom(n);
+    return out;
+  }
+
+  // rdflib-shaped synthetic store reflecting the known rdf:type triples —
+  // enough for SLIP-48 canHandle gates. Same as chrome's makeStore.
+  function makeStore(types, url) {
+    return {
+      type: () => (types && types[0]) || null,
+      get: () => null,
+      statementsMatching(_s, predicate) {
+        if (!types || !types.length) return [];
+        if (predicate === undefined || predicate?.value === RDF_TYPE) {
+          return types.map(t => ({
+            subject: { value: url, termType: "NamedNode" },
+            predicate: { value: RDF_TYPE, termType: "NamedNode" },
+            object: { value: t, termType: "NamedNode" },
+          }));
+        }
+        return [];
+      },
+    };
+  }
+
+  function ctx() {
+    return {
+      get auth() { return Auth.get(); },
+      fetch: Auth.fetch,
+      subscribe: Pod.subscribeUrl,
+      openWindow: opts => openApp("apphost", { custom: opts }),
+    };
+  }
+
+  async function openPaneFor({ url, doc, types, name, icon }) {
+    const entry = await findPaneFor(types);
+    if (!entry) return null;
+    openApp("pane", { entry, url, doc, types, name, icon });
+    return entry;
+  }
+
+  return { loadRegistry, loadModule, findPaneFor, extractTypes, makeStore, ctx, openPaneFor };
+})();
+
 const extOf = name => { const i = name.lastIndexOf("."); return i > 0 ? name.slice(i + 1).toLowerCase() : ""; };
 const TEXT_EXTS = ["txt", "md", "log", "js", "json", "css", "html", "csv"];
 
@@ -804,8 +1277,9 @@ function iconFor(node) {
   if (node.appId) return APPS[node.appId] ? APPS[node.appId].icon : "📦";
   if (node.type === "dir") return "📁";
   const e = extOf(node.name);
-  if (e === "png" || e === "jpg") return "🖼️";
+  if (["png", "jpg", "jpeg", "gif", "webp", "svg"].includes(e)) return "🖼️";
   if (e === "app") return "📦";
+  if (["jsonld", "ttl"].includes(e)) return "🔗";
   if (["js", "json", "css", "html"].includes(e)) return "📜";
   return "📄";
 }
@@ -1101,11 +1575,37 @@ function renderMenubar() {
   }
   const right = $("#mbRight");
   right.replaceChildren(
+    h("div", { class: "mb-item", id: "mbAuth", title: "Account", onclick: e => { e.stopPropagation(); authMenu(e.currentTarget); } }, authLabel()),
     h("div", { class: "mb-item", id: "mbSpotBtn", title: "Search (⌘Space)", onclick: toggleSpot }, "🔍"),
     h("div", { class: "mb-item", id: "mbCCBtn", title: "Control Center", onclick: toggleCC }, "◐"),
     h("div", { class: "mb-item" }, "🔋 100%"),
     h("div", { class: "mb-item", id: "mbClock" }, mbClockText())
   );
+}
+function authLabel() {
+  const a = Auth.get();
+  if (!a.loggedIn) return "Sign In";
+  if (a.type === "solid") { try { return "🪐 " + new URL(a.id).hostname; } catch (e) { return "🪐 pod"; } }
+  return "🔑 " + a.id.slice(0, 8) + "…";
+}
+function authMenu(anchor) {
+  const a = Auth.get();
+  if (!a.loggedIn) {
+    showMenu([
+      { label: "Sign in — Solid or Nostr…", action: () => Auth.login() },
+      { sep: true },
+      { label: "About identity", action: () => openApp("help") },
+    ], anchor);
+    return;
+  }
+  showMenu([
+    { label: a.id.length > 34 ? a.id.slice(0, 34) + "…" : a.id, disabled: true },
+    { sep: true },
+    { label: "Open Pod in Files", disabled: !Pod.status.connected, action: () => openApp("finder", { path: Pod.MOUNT }) },
+    { label: "Browse Registry", action: () => openApp("registry") },
+    { sep: true },
+    { label: "Sign Out", action: () => Auth.logout() },
+  ], anchor);
 }
 function mbClockText() {
   const d = new Date();
@@ -1243,9 +1743,38 @@ function defaultOpen(path) {
   if (n.type === "dir") return openApp("finder", { path: VFS.norm(path) });
   const e = extOf(n.name);
   if (n.appId) return openApp(n.appId);
+  if (n.remote) return openRemote(VFS.norm(path), n, e);
   if (e === "png") return openApp("photos", { path: VFS.norm(path) });
   if (TEXT_EXTS.includes(e)) return openApp("notes", { path: VFS.norm(path) });
   notify("Can't open file", n.name, "⚠️");
+}
+
+// Opening a pod resource: images view raw; RDF documents dispatch to a
+// SLIP-48 registry pane by rdf:type (same flow as chrome's Files); plain
+// text opens in Notes with write-through saves back to the pod.
+async function openRemote(path, n, e) {
+  if (["png", "jpg", "jpeg", "gif", "webp", "svg", "avif"].includes(e)) return window.open(n.remote, "_blank");
+  if (["jsonld", "json"].includes(e) || !TEXT_EXTS.includes(e)) {
+    try {
+      const r = await Auth.fetch(n.remote, { cache: "reload", headers: { Accept: "application/ld+json" } });
+      if (r.ok) {
+        const body = (await r.text()).trim();
+        if (body.startsWith("{") || body.startsWith("[")) {
+          const doc = JSON.parse(body);
+          const types = Panes.extractTypes(doc, n.remote);
+          if (types.length && await Panes.openPaneFor({ url: n.remote, doc, types, name: n.name })) return;
+        }
+        // No pane matched — cache what we fetched and fall through to Notes.
+        n.content = body; n.loaded = true;
+      }
+    } catch (err) { /* fall through */ }
+  }
+  if (!n.loaded) await Pod.loadFile(path);
+  const node = VFS.node(path);
+  if (node && typeof node.content === "string" && !node.mime?.startsWith("image/")) {
+    return openApp("notes", { path });
+  }
+  window.open(n.remote, "_blank");
 }
 
 /* ============================== DESKTOP ICONS / WIDGETS / CTX ============================== */
@@ -1261,6 +1790,7 @@ function renderDeskIcons() {
     wrap.append(el);
   };
   mk("💽", "Glass HD", () => openApp("finder", { path: "/" }));
+  if (VFS.node(Pod.MOUNT)) mk("🪐", "Pod", () => openApp("finder", { path: Pod.MOUNT }));
   for (const n of VFS.ls("/Desktop")) {
     mk(iconFor(n), n.name, () => defaultOpen("/Desktop/" + n.name));
   }
@@ -1381,7 +1911,7 @@ function buildAbout(body, win) {
   body.append(h("div", { class: "ab", style: { overflowY: "auto" } },
     h("div", { class: "logo" }, "❖"),
     h("div", { class: "os" }, "Glass"),
-    h("div", { class: "ver" }, "Version 0.1 · Single File Edition"),
+    h("div", { class: "ver" }, "Version 0.2 · Solid Edition"),
     h("div", { class: "specs" }, specs.flatMap(([k, v]) => [h("div", { class: "k" }, k), h("div", null, v)])),
     h("button", {
       class: "btn primary", style: { marginTop: "18px" },
@@ -1435,13 +1965,15 @@ function buildFinder(body, win, args) {
   let infoPop = null;
 
   const FAVS = [["Desktop", "🖥️"], ["Documents", "📄"], ["Notes", "📝"], ["Photos", "🖼️"], ["Applications", "🚀"]];
+  const podRow = h("div", { class: "sb-i", dataset: { path: Pod.MOUNT }, onclick: () => nav(Pod.MOUNT) }, h("span", null, "🪐"), "Pod");
   side.append(h("div", { class: "sb-h" }, "Favorites"),
     ...FAVS.map(([n, ic]) => h("div", {
       class: "sb-i", dataset: { path: "/" + n },
       onclick: () => nav("/" + n)
     }, h("span", null, ic), n)),
     h("div", { class: "sb-h" }, "Locations"),
-    h("div", { class: "sb-i", dataset: { path: "/" }, onclick: () => nav("/") }, h("span", null, "💽"), "Glass HD"));
+    h("div", { class: "sb-i", dataset: { path: "/" }, onclick: () => nav("/") }, h("span", null, "💽"), "Glass HD"),
+    podRow);
 
   function nav(path, from) {
     path = VFS.norm(path, st.cwd);
@@ -1458,6 +1990,9 @@ function buildFinder(body, win, args) {
     win.setTitle(st.cwd === "/" ? "Glass HD" : st.cwd.split("/").pop());
     backBtn.classList.toggle("dis", !st.back.length);
     fwdBtn.classList.toggle("dis", !st.fwd.length);
+    podRow.style.display = VFS.node(Pod.MOUNT) ? "" : "none";
+    const cn = VFS.node(st.cwd);
+    if (cn && cn.remote && cn.type === "dir" && !cn.loaded && !cn.hydrating) Pod.hydrate(st.cwd);
     $$(".sb-i", side).forEach(el => el.classList.toggle("sel", el.dataset.path === st.cwd));
     // crumbs
     crumbs.replaceChildren();
@@ -1492,10 +2027,12 @@ function buildFinder(body, win, args) {
         },
           h("span", { class: "li-ico" }, iconFor(n)),
           h("span", { class: "li-name" }, n.name),
-          h("span", { class: "li-meta" }, n.type === "dir" ? `${Object.keys(n.children).length} items` : fmtBytes(VFS.size(n))),
+          h("span", { class: "li-meta" }, n.type === "dir" ? `${Object.keys(n.children).length} items` : fmtBytes(n.remoteSize ?? VFS.size(n))),
           h("span", { class: "li-meta" }, fmtDate(n.modified))))));
     }
-    status.textContent = `${items.length} items` + (st.sel ? ` — "${st.sel}" selected` : "");
+    const cur = VFS.node(st.cwd);
+    status.textContent = `${items.length} items` + (st.sel ? ` — "${st.sel}" selected` : "")
+      + (cur && cur.hydrating ? " — syncing with pod…" : (cur && cur.remote ? " — " + cur.remote : ""));
   }
   function paintSel() {
     $$(".fi, .li", content).forEach(el =>
@@ -1521,6 +2058,12 @@ function buildFinder(body, win, args) {
   }
 
   win.reopen = a => { if (a.path) nav(a.path); };
+  // Live repaint when the pod cache (or any VFS write) touches this view.
+  const offBus = VFSBus.on(p => {
+    if (!VFS.node(st.cwd)) { st.cwd = "/Desktop"; st.back = []; st.fwd = []; }
+    paint();
+  });
+  win.onClose = () => offBus();
   body.append(
     h("div", { class: "toolbar" }, backBtn, fwdBtn, crumbs, viewSeg, infoBtn, search),
     h("div", { class: "split" }, side, content),
@@ -1702,7 +2245,7 @@ function buildTerminal(body, win) {
   const print = (txt, cls) => { out.append(h("div", { class: cls || "" }, txt)); out.scrollTop = out.scrollHeight; };
   const printCmd = cmd => out.append(h("div", null, h("span", { class: "pr" }, promptLabel() + " "), h("span", null, cmd)));
 
-  print("Glass — glass-sh v0.1", "dim");
+  print("Glass — glass-sh v0.2", "dim");
   print('Type "help" to get started.', "dim");
 
   const COMMANDS = {
@@ -1715,11 +2258,24 @@ function buildTerminal(body, win) {
   mkdir <dir>     make directory       rm <path>   move to Trash
   open <app|path> open app or file     search <q>  find files
   tree            show file tree       neofetch    system info
-  date            current date         whoami      current user
+  date            current date         whoami      current user / WebID
+  login / logout  Solid or Nostr sign-in
+  mount <url>     mount an LDP container at /Pod
+  pod             pod mount status
   history         command history      clear       clear screen
   reboot          restart the system`),
     pwd: () => print(st.cwd),
     ls: a => {
+      const p = VFS.norm(a[0] || ".", st.cwd);
+      const nd = VFS.node(p);
+      if (nd && nd.type === "dir" && nd.remote && !nd.loaded) {
+        print("syncing " + nd.remote + " …", "dim");
+        Pod.hydrate(p).then(() => {
+          const items = VFS.ls(p) || [];
+          print(items.map(n => n.type === "dir" ? n.name + "/" : n.name).join("  ") || "(empty)");
+        });
+        return;
+      }
       const items = VFS.ls(a[0] || ".", st.cwd);
       if (!items) return print(`ls: no such file or directory: ${a[0]}`, "er");
       print(items.map(n => n.type === "dir" ? n.name + "/" : n.name).join("  ") || "(empty)");
@@ -1734,6 +2290,13 @@ function buildTerminal(body, win) {
     },
     cat: a => {
       if (!a[0]) return print("usage: cat <file>", "er");
+      const p = VFS.norm(a.join(" "), st.cwd);
+      const n = VFS.node(p);
+      if (n && n.type === "file" && n.remote && !n.loaded) {
+        print("fetching " + n.remote + " …", "dim");
+        Pod.loadFile(p).then(nn => print(nn.content || "(empty file)", nn.content ? "" : "dim"));
+        return;
+      }
       const c = VFS.read(a.join(" "), st.cwd);
       if (c == null) return print(`cat: no such file: ${a.join(" ")}`, "er");
       print(c || "(empty file)", c ? "" : "dim");
@@ -1796,7 +2359,7 @@ function buildTerminal(body, win) {
              \\/`, "ok");
       print(`guest@glass
 ──────────────
-OS: Glass 0.1
+OS: Glass 0.2
 Kernel: single-file
 Shell: glass-sh
 DE: Glass
@@ -1805,7 +2368,23 @@ Memory: 128 GB
 Uptime: ${Math.floor(performance.now() / 60000)} min`, "dim");
     },
     date: () => print(new Date().toString()),
-    whoami: () => print("guest"),
+    whoami: () => { const a = Auth.get(); print(a.loggedIn ? a.id : "guest", a.loggedIn ? "ok" : ""); },
+    login: () => { Auth.login(); print("opening sign-in…", "dim"); },
+    logout: () => { Auth.logout(); print("signed out", "ok"); },
+    mount: a => {
+      if (!a[0]) return print("usage: mount <ldp-container-url>   (mounts at /Pod)", "er");
+      let url = a[0];
+      if (!/^https?:\/\//.test(url)) url = "https://" + url;
+      print("mounting " + url + " …", "dim");
+      Pod.mount(url).then(() => {
+        print("mounted at /Pod", "ok");
+        renderDeskIcons();
+      }).catch(e => print("mount failed: " + e.message, "er"));
+    },
+    pod: () => {
+      if (!Pod.status.connected) return print("no pod mounted — try: login, or: mount <url>", "dim");
+      print(`mounted:  ${Pod.storage}\nsyncing:  ${Pod.status.syncing ? "yes" : "idle"}\nlast err: ${Pod.status.error || "none"}`);
+    },
     uname: () => print("GlassOS glass.local 0.1.0 Glass_KERNEL arm64"),
     hostname: () => print("glass.local"),
     history: () => print(st.history.map((c, i) => `  ${i + 1}  ${c}`).join("\n") || "(empty)"),
@@ -2404,6 +2983,91 @@ function buildTrash(body, win) {
   paint();
 }
 
+/* ============================== APP: PANE HOST (SLIP-48) ============================== */
+function buildPaneHost(body, win, args) {
+  const container = h("div", { class: "content", style: { userSelect: "text" } });
+  body.append(container);
+  container.append(h("div", { class: "pad muted center" }, "Loading pane…"));
+  const { entry, url, doc, types } = args;
+  win.setTitle(args.name || entry.name || (url || "").split("/").pop() || "Pane");
+  Panes.loadModule(entry.url).then(pane => {
+    container.replaceChildren();
+    container.addEventListener("pane:delete", () => WM.close(win));
+    const subject = { value: url, termType: "NamedNode" };
+    // SLIP-48 / LOSOS 5-arg call — identical to chrome/hub dispatch.
+    return pane.render(subject, Panes.makeStore(types, url), container, doc, Panes.ctx());
+  }).catch(e => {
+    container.replaceChildren(h("div", { class: "pad muted center" }, "⚠️ Pane error — " + e.message));
+  });
+}
+
+/* ============================== APP: HUB-APP HOST ============================== */
+function buildAppHost(body, win, args) {
+  const container = h("div", { class: "content", style: { userSelect: "text" } });
+  body.append(container);
+  if (args.custom && typeof args.custom.render === "function") {
+    // ctx.openWindow adapter — a pane/app asked the host for a fresh window.
+    win.setTitle(args.custom.title || "Window");
+    try { args.custom.render(container, win); } catch (e) {
+      container.replaceChildren(h("div", { class: "pad muted center" }, "⚠️ " + e.message));
+    }
+    return;
+  }
+  const entry = args.entry;
+  win.setTitle(entry.name);
+  container.append(h("div", { class: "pad muted center" }, "Loading " + entry.name + "…"));
+  Panes.loadModule(entry.url).then(app => {
+    container.replaceChildren();
+    // hub-pod app interface: render(container, ctx).
+    return app.render(container, Panes.ctx());
+  }).catch(e => {
+    container.replaceChildren(h("div", { class: "pad muted center" }, "⚠️ App error — " + e.message));
+  });
+}
+
+/* ============================== APP: REGISTRY ============================== */
+function buildRegistry(body, win) {
+  const content = h("div", { class: "content" });
+  const status = h("div", { class: "statusbar" }, "solid-apps registry");
+  const localName = s => String(s || "").split(/[#/:]/).pop();
+  async function load() {
+    content.replaceChildren(h("div", { class: "pad muted center" }, "Loading registry…"));
+    try {
+      const entries = await Panes.loadRegistry();
+      const apps = entries.filter(e => e.type === "app");
+      const panes = entries.filter(e => e.type === "pane");
+      content.replaceChildren(
+        h("div", { class: "sb-h", style: { padding: "10px 14px 2px" } }, "Apps — run in a Glass window"),
+        h("div", { class: "list" }, ...apps.map(e =>
+          h("div", { class: "li", onclick: () => openApp("apphost", { entry: e }) },
+            h("span", { class: "li-ico" }, e.icon),
+            h("div", { style: { flex: 1, minWidth: 0 } },
+              h("div", null, e.name),
+              h("div", { class: "muted small" }, e.description)),
+            h("span", { class: "li-meta" }, "open ›")))),
+        h("div", { class: "sb-h", style: { padding: "10px 14px 2px" } }, "Panes — open automatically for matching pod resources"),
+        h("div", { class: "list" }, ...panes.map(e =>
+          h("div", { class: "li" },
+            h("span", { class: "li-ico" }, e.icon),
+            h("div", { style: { flex: 1, minWidth: 0 } },
+              h("div", null, e.name),
+              h("div", { class: "muted small" }, e.description)),
+            h("span", { class: "li-meta" },
+              [].concat(e.forClass || []).map(localName).join(", "))))));
+      status.textContent = apps.length + " apps · " + panes.length + " panes — shared with hub, chrome, ubuntu, win98";
+    } catch (e) {
+      content.replaceChildren(h("div", { class: "pad muted center" }, "⚠️ Couldn't load registry — " + e.message));
+    }
+  }
+  body.append(
+    h("div", { class: "toolbar" },
+      h("span", { class: "muted small" }, "solid-apps.github.io/registry"),
+      h("span", { class: "spacer" }),
+      h("button", { class: "tbtn", onclick: load }, "⟳")),
+    content, status);
+  load();
+}
+
 /* ============================== APP REGISTRY ============================== */
 const APPS = {
   finder:     { name: "Files",     icon: "📁", w: 780, h: 500, title: "Files",     build: buildFinder },
@@ -2419,8 +3083,11 @@ const APPS = {
   trash:      { name: "Trash",      icon: "🗑️", w: 480, h: 340, title: "Trash",      build: buildTrash },
   about:      { name: "About",      icon: "❖", w: 420, h: 480, title: "About Glass", build: buildAbout, hidden: true },
   help:       { name: "Help",       icon: "❓", w: 460, h: 400, title: "Help",        build: buildHelp, hidden: true },
+  registry:   { name: "Registry",   icon: "🧩", w: 560, h: 480, title: "Registry",   build: buildRegistry },
+  apphost:    { name: "App",        icon: "🧩", w: 720, h: 520, title: "App",        build: buildAppHost, multi: true, hidden: true },
+  pane:       { name: "Pane",       icon: "🧩", w: 720, h: 520, title: "Pane",       build: buildPaneHost, multi: true, hidden: true },
 };
-const DOCK_ORDER = ["finder", "safari", "notes", "photos", "music", "calculator", "terminal", "weather", "clock", "-", "settings", "trash"];
+const DOCK_ORDER = ["finder", "safari", "notes", "photos", "music", "calculator", "terminal", "weather", "clock", "-", "registry", "settings", "trash"];
 
 /* ============================== BOOT ============================== */
 function boot() {
@@ -2436,6 +3103,8 @@ function boot() {
   renderDock();
   renderDeskIcons();
   renderWidgets();
+  Auth.on(() => renderMenubar());
+  VFSBus.on(p => { if (p === "/" || p === Pod.MOUNT || p.startsWith("/Desktop")) renderDeskIcons(); });
 
   // spotlight input
   const si = $("#spotInput");
