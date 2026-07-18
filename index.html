@@ -449,7 +449,7 @@ input[type="range"]::-webkit-slider-thumb {
 
 /* ============================== APP: TERMINAL ============================== */
 .term { height: 100%; display: flex; flex-direction: column; background: rgba(6,6,10,0.88); font-family: "SF Mono", ui-monospace, Menlo, monospace; font-size: 12.5px; }
-.term-out { flex: 1; overflow-y: auto; padding: 10px 12px; line-height: 1.55; white-space: pre-wrap; word-break: break-word; }
+.term-out { flex: 1; overflow-y: auto; padding: 10px 12px; line-height: 1.55; white-space: pre-wrap; word-break: break-word; user-select: text; cursor: text; }
 .term-out .pr { color: var(--accent); }
 .term-out .ok { color: var(--ok); }
 .term-out .er { color: #ff7a72; }
@@ -974,7 +974,10 @@ const Pod = (() => {
         if (c.remote && !seen.has(name) && !c.pending && !c.pinned) delete n.children[name];
       }
       n.loaded = true;
-      subscribeUrl(n.remote, () => hydrate(path)).catch(() => {});
+      // Stable callback per node — subscribeUrl's Set dedupes it, so
+      // re-hydration doesn't pile up extra subscriptions.
+      if (!n.onPub) n.onPub = () => hydrate(path);
+      subscribeUrl(n.remote, n.onPub).catch(() => {});
     } catch (e) { status.error = e.message; }
     n.hydrating = false; status.syncing--;
     VFSBus.emit(path);
@@ -1013,7 +1016,8 @@ const Pod = (() => {
       const pr = VFS.parent(path);
       const parentRemote = pr && pr.dir && pr.dir.remote;
       if (!parentRemote) return;
-      n.remote = parentRemote + encodeURIComponent(n.name) + (n.type === "dir" ? "/" : "");
+      n.remote = parentRemote + (parentRemote.endsWith("/") ? "" : "/")
+        + encodeURIComponent(n.name) + (n.type === "dir" ? "/" : "");
     }
     status.syncing++; VFSBus.emit(path);
     try {
@@ -1369,9 +1373,11 @@ const WM = (() => {
       const up = () => {
         tb.removeEventListener("pointermove", move);
         tb.removeEventListener("pointerup", up);
+        tb.removeEventListener("pointercancel", up);
       };
       tb.addEventListener("pointermove", move);
       tb.addEventListener("pointerup", up);
+      tb.addEventListener("pointercancel", up);
     });
     tb.addEventListener("dblclick", e => { if (!e.target.closest(".tl")) toggleMax(win); });
     el.addEventListener("pointerdown", () => focus(win), true);
@@ -1414,7 +1420,7 @@ const WM = (() => {
     win.el.style.transition = "transform .42s cubic-bezier(.4,0,.5,1), opacity .42s";
     win.el.style.transform = `translate(${dx}px, ${dy}px) scale(0.02)`;
     win.el.style.opacity = "0";
-    setTimeout(() => { win.el.style.pointerEvents = "none"; }, 430);
+    setTimeout(() => { if (win.minimized) win.el.style.pointerEvents = "none"; }, 430);
     focused = wins.filter(w => !w.minimized).pop() || null;
     if (focused) focus(focused);
     renderDockDots();
@@ -1427,7 +1433,7 @@ const WM = (() => {
     win.el.style.transition = "transform .35s cubic-bezier(.2,1,.4,1), opacity .3s";
     win.el.style.transform = "";
     win.el.style.opacity = "";
-    setTimeout(() => { win.el.style.transition = ""; }, 360);
+    setTimeout(() => { if (!win.minimized) win.el.style.transition = ""; }, 360);
     focus(win);
     renderDockDots();
   }
@@ -1799,10 +1805,12 @@ function renderDeskIcons() {
     mk(iconFor(n), n.name, () => defaultOpen("/Desktop/" + n.name));
   }
 }
+let wdgTimer = null;
 function renderWidgets() {
   const w = $("#widgets");
   w.classList.toggle("hidden", !Store.data.widgets);
   w.replaceChildren();
+  clearInterval(wdgTimer);
   if (!Store.data.widgets) return;
   const now = new Date();
   w.append(
@@ -1815,7 +1823,7 @@ function renderWidgets() {
       h("div", { class: "big" }, "72° ☀️"),
       h("div", { class: "sub" }, "Sunny · H:78 L:55")));
   const tick = () => { const c = $("#wdgClock"); if (c) c.textContent = fmtClock(new Date()); };
-  setInterval(tick, 10000);
+  wdgTimer = setInterval(tick, 10000);
 }
 function deskContextMenu(e) {
   if (e.target.closest(".win") || e.target.closest("#menubar") || e.target.closest("#dock") ||
@@ -1878,8 +1886,10 @@ function missionControl() {
     w.el.style.transform = w.el.dataset.mcTransform;
     w.el.style.pointerEvents = "auto";
   });
+  const handlers = [];
   const exit = target => {
     wins.forEach(w => { w.el.style.transform = ""; w.el.classList.remove("mc", "mc-hover"); });
+    handlers.forEach(([el, ev, fn]) => el.removeEventListener(ev, fn));
     $("#mc-hint").style.display = "none";
     mcOn = false;
     document.removeEventListener("keydown", onKey);
@@ -1888,12 +1898,13 @@ function missionControl() {
   const onKey = e => { if (e.key === "Escape" || e.key === "F3") { e.preventDefault(); exit(); } };
   document.addEventListener("keydown", onKey);
   wins.forEach(w => {
-    w.el.addEventListener("pointerenter", () => w.el.classList.add("mc-hover"));
-    w.el.addEventListener("pointerleave", () => w.el.classList.remove("mc-hover"));
-    w.el.addEventListener("pointerdown", function onDown(ev) {
-      if (!mcOn) { w.el.removeEventListener("pointerdown", onDown); return; }
-      ev.stopPropagation(); exit(w);
-    }, { once: false });
+    const enter = () => w.el.classList.add("mc-hover");
+    const leave = () => w.el.classList.remove("mc-hover");
+    const down = ev => { ev.stopPropagation(); exit(w); };
+    w.el.addEventListener("pointerenter", enter);
+    w.el.addEventListener("pointerleave", leave);
+    w.el.addEventListener("pointerdown", down);
+    handlers.push([w.el, "pointerenter", enter], [w.el, "pointerleave", leave], [w.el, "pointerdown", down]);
   });
 }
 
@@ -1927,7 +1938,7 @@ function buildAbout(body, win) {
 /* ============================== APP: HELP ============================== */
 function buildHelp(body) {
   const rows = [
-    ["⌘ / Ctrl + Space", "Search search"],
+    ["⌘ / Ctrl + Space", "Open Search"],
     ["⌘ + W", "Close window"],
     ["⌘ + M", "Minimize window"],
     ["F3", "Overview"],
@@ -2228,6 +2239,8 @@ function buildCalc(body, win) {
 
   const onKey = e => {
     if (WM.current() !== win) return;
+    // Don't swallow keystrokes meant for a text field (Spotlight, menus, …).
+    if (e.target.closest && e.target.closest("input, textarea, select")) return;
     const k = e.key;
     if (/^[0-9.]$/.test(k)) press(k);
     else if (["+", "-", "*", "/"].includes(k)) press(k);
@@ -2413,12 +2426,13 @@ Uptime: ${Math.floor(performance.now() / 60000)} min`, "dim");
   input.addEventListener("keydown", e => {
     if (e.key === "Enter") { run(input.value); input.value = ""; }
     else if (e.key === "ArrowUp") { e.preventDefault(); if (st.hi > 0) input.value = st.history[--st.hi] || ""; }
-    else if (e.key === "ArrowDown") { e.preventDefault(); input.value = st.hi < st.history.length - 1 ? st.history[++st.hi] : (++st.hi, ""); }
+    else if (e.key === "ArrowDown") { e.preventDefault(); if (st.hi < st.history.length) st.hi++; input.value = st.history[st.hi] || ""; }
   });
 
   const wrap = h("div", { class: "term" }, out,
     h("div", { class: "term-in-line" }, h("span", { class: "pr" }, "➜"), input));
-  wrap.addEventListener("pointerdown", () => setTimeout(() => input.focus(), 0));
+  // Focus the prompt on click — unless the user is selecting output text.
+  wrap.addEventListener("click", () => { if (!getSelection().toString()) input.focus(); });
   body.append(wrap);
   setTimeout(() => input.focus(), 50);
 }
@@ -2766,6 +2780,7 @@ function buildPhotos(body, win, args) {
   }
   function show(i) {
     const fs = files();
+    if (!fs.length) return hide();
     st.view = (i + fs.length) % fs.length;
     const n = fs[st.view];
     viewer.replaceChildren(
