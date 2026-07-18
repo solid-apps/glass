@@ -938,6 +938,10 @@ const Pod = (() => {
     let n = VFS.node(MOUNT);
     if (!n) n = raw.mkdir(MOUNT);
     n.remote = storage; n.loaded = false; n.children = {};
+    // Pin a /public child so the pod's public/ container is always a
+    // first-class location, even if the root container listing omits it.
+    const pub = raw.mkdir(MOUNT + "/public");
+    if (pub) { pub.remote = storage + "public/"; pub.loaded = false; pub.pinned = true; }
     status.connected = true; status.error = null;
     renderDeskIcons();
     VFSBus.emit(MOUNT);
@@ -967,7 +971,7 @@ const Pod = (() => {
         if (m) child.modified = m;
       }
       for (const [name, c] of Object.entries(n.children)) {
-        if (c.remote && !seen.has(name) && !c.pending) delete n.children[name];
+        if (c.remote && !seen.has(name) && !c.pending && !c.pinned) delete n.children[name];
       }
       n.loaded = true;
       subscribeUrl(n.remote, () => hydrate(path)).catch(() => {});
@@ -1966,6 +1970,7 @@ function buildFinder(body, win, args) {
 
   const FAVS = [["Desktop", "🖥️"], ["Documents", "📄"], ["Notes", "📝"], ["Photos", "🖼️"], ["Applications", "🚀"]];
   const podRow = h("div", { class: "sb-i", dataset: { path: Pod.MOUNT }, onclick: () => nav(Pod.MOUNT) }, h("span", null, "🪐"), "Pod");
+  const pubRow = h("div", { class: "sb-i", dataset: { path: Pod.MOUNT + "/public" }, onclick: () => nav(Pod.MOUNT + "/public"), style: { paddingLeft: "22px" } }, h("span", null, "🌐"), "Public");
   side.append(h("div", { class: "sb-h" }, "Favorites"),
     ...FAVS.map(([n, ic]) => h("div", {
       class: "sb-i", dataset: { path: "/" + n },
@@ -1973,7 +1978,7 @@ function buildFinder(body, win, args) {
     }, h("span", null, ic), n)),
     h("div", { class: "sb-h" }, "Locations"),
     h("div", { class: "sb-i", dataset: { path: "/" }, onclick: () => nav("/") }, h("span", null, "💽"), "Glass HD"),
-    podRow);
+    podRow, pubRow);
 
   function nav(path, from) {
     path = VFS.norm(path, st.cwd);
@@ -1991,6 +1996,7 @@ function buildFinder(body, win, args) {
     backBtn.classList.toggle("dis", !st.back.length);
     fwdBtn.classList.toggle("dis", !st.fwd.length);
     podRow.style.display = VFS.node(Pod.MOUNT) ? "" : "none";
+    pubRow.style.display = VFS.node(Pod.MOUNT + "/public") ? "" : "none";
     const cn = VFS.node(st.cwd);
     if (cn && cn.remote && cn.type === "dir" && !cn.loaded && !cn.hydrating) Pod.hydrate(st.cwd);
     $$(".sb-i", side).forEach(el => el.classList.toggle("sel", el.dataset.path === st.cwd));
