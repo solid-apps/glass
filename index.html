@@ -1754,6 +1754,7 @@ function defaultOpen(path) {
   const e = extOf(n.name);
   if (n.appId) return openApp(n.appId);
   if (n.remote) return openRemote(VFS.norm(path), n, e);
+  if (["html", "htm"].includes(e)) return openApp("htmlview", { path: VFS.norm(path) });
   if (e === "png") return openApp("photos", { path: VFS.norm(path) });
   if (TEXT_EXTS.includes(e)) return openApp("notes", { path: VFS.norm(path) });
   notify("Can't open file", n.name, "⚠️");
@@ -1764,6 +1765,7 @@ function defaultOpen(path) {
 // text opens in Notes with write-through saves back to the pod.
 async function openRemote(path, n, e) {
   if (["png", "jpg", "jpeg", "gif", "webp", "svg", "avif"].includes(e)) return window.open(n.remote, "_blank");
+  if (["html", "htm"].includes(e)) return openApp("htmlview", { path });
   if (["jsonld", "json"].includes(e) || !TEXT_EXTS.includes(e)) {
     try {
       const r = await Auth.fetch(n.remote, { cache: "reload", headers: { Accept: "application/ld+json" } });
@@ -3089,6 +3091,28 @@ function buildRegistry(body, win) {
   load();
 }
 
+/* ============================== APP: HTML VIEWER ============================== */
+function buildHtmlView(body, win, args) {
+  const path = VFS.norm(args.path || "");
+  const n = VFS.node(path);
+  win.setTitle(path.split("/").pop() || "HTML");
+  if (!n || n.type !== "file") {
+    body.append(h("div", { class: "pad muted center" }, "File not found — " + path));
+    return;
+  }
+  const frame = h("iframe", { style: { flex: 1, border: "none", width: "100%", background: "#fff" } });
+  // Pod files load straight from their URL so relative links keep working;
+  // local files render via srcdoc, sandboxed so their scripts can't touch Glass.
+  if (n.remote) frame.src = n.remote;
+  else { frame.setAttribute("sandbox", "allow-scripts"); frame.srcdoc = n.content || ""; }
+  body.append(
+    h("div", { class: "toolbar" },
+      h("span", { class: "muted small", style: { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, n.remote || path),
+      h("span", { class: "spacer" }),
+      h("button", { class: "tbtn", onclick: () => openApp("notes", { path }) }, "Source")),
+    frame);
+}
+
 /* ============================== APP REGISTRY ============================== */
 const APPS = {
   finder:     { name: "Files",     icon: "📁", w: 780, h: 500, title: "Files",     build: buildFinder },
@@ -3105,6 +3129,7 @@ const APPS = {
   about:      { name: "About",      icon: "❖", w: 420, h: 480, title: "About Glass", build: buildAbout, hidden: true },
   help:       { name: "Help",       icon: "❓", w: 460, h: 400, title: "Help",        build: buildHelp, hidden: true },
   registry:   { name: "Registry",   icon: "🧩", w: 560, h: 480, title: "Registry",   build: buildRegistry },
+  htmlview:   { name: "HTML",       icon: "🌐", w: 720, h: 540, title: "HTML",       build: buildHtmlView, multi: true, hidden: true },
   apphost:    { name: "App",        icon: "🧩", w: 720, h: 520, title: "App",        build: buildAppHost, multi: true, hidden: true },
   pane:       { name: "Pane",       icon: "🧩", w: 720, h: 520, title: "Pane",       build: buildPaneHost, multi: true, hidden: true },
 };
